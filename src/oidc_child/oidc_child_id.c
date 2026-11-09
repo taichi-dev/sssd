@@ -720,7 +720,23 @@ errno_t okta_lookup(TALLOC_CTX *mem_ctx, enum oidc_cmd oidc_cmd,
         const char *http_data = get_http_data(rest_ctx);
         json_error_t json_error;
         json_t *resp = json_loads(http_data, 0, &json_error);
-        if (resp != NULL && json_is_array(resp) && json_array_size(resp) > 0) {
+        if (resp == NULL) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Failed to parse Okta search response for [%s] on line [%d]: [%s].\n",
+                  input, json_error.line, json_error.text);
+            ret = EIO;
+            goto done;
+        }
+
+        if (!json_is_array(resp)) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Expected an array in Okta search response for [%s].\n", input);
+            json_decref(resp);
+            ret = EIO;
+            goto done;
+        }
+
+        if (json_array_size(resp) > 0) {
             json_decref(resp);
             found = true;
             break;
@@ -734,9 +750,13 @@ errno_t okta_lookup(TALLOC_CTX *mem_ctx, enum oidc_cmd oidc_cmd,
     }
 
     if (!found) {
-        DEBUG(SSSDBG_OP_FAILURE,
+        /* Every strategy answered without a match. Like the keycloak lookup,
+         * report an empty result array instead of an error, so the backend
+         * can delete a stale entry and answer not-found. Any failed request
+         * above left through EOK-less ret and stays a failure. */
+        DEBUG(SSSDBG_TRACE_FUNC,
               "No results found for [%s] after all search strategies.\n", input);
-        ret = ENOENT;
+        ret = EOK;
         goto done;
     }
 
