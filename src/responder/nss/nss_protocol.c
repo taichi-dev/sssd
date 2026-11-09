@@ -53,6 +53,13 @@ sss_nss_protocol_done(struct cli_ctx *cli_ctx, errno_t error)
         DEBUG(SSSDBG_TRACE_ALL, "Sending reply: not found\n");
         ret = sss_cmd_send_empty(cli_ctx);
         goto done;
+    case ERR_OFFLINE:
+        /* The entry is not cached and its backend request failed. A request
+         * that asked for that distinction reads the answer as "try again". */
+        DEBUG(SSSDBG_TRACE_ALL,
+              "Sending reply: backend failure, try again\n");
+        ret = sss_cmd_send_error(cli_ctx, EAGAIN);
+        goto done;
     default:
         DEBUG(SSSDBG_TRACE_ALL, "Sending reply: error [%d]: %s\n",
               error, sss_strerror(error));

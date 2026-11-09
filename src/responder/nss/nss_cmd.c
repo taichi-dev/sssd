@@ -67,6 +67,12 @@ static errno_t eval_flags(struct sss_nss_cmd_ctx *cmd_ctx,
         cache_req_data_set_bypass_dp(data, true);
     }
 
+    if ((cmd_ctx->flags & SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE) != 0) {
+        /* Let an uncached entry whose backend request failed answer
+         * EAGAIN instead of ENOENT; the reply path maps it. */
+        cache_req_data_set_propogate_offline_status(data, true);
+    }
+
     return EOK;
 }
 

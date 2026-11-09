@@ -31,6 +31,7 @@
 #include "responder/common/negcache.h"
 #include "responder/nss/nss_private.h"
 #include "responder/nss/nss_protocol.h"
+#include "providers/data_provider.h"
 #include "providers/ipa/ipa_subdomains.h"
 #include "sss_client/idmap/sss_nss_idmap.h"
 #include "util/util_sss_idmap.h"
@@ -161,10 +162,17 @@ void __wrap_sss_cmd_done(struct cli_ctx *cctx, void *freectx)
         pctx = talloc_get_type(cctx->protocol_ctx, struct cli_protocol);
         packet = pctx->creq->out;
 
-        __real_sss_packet_get_body(packet, &body, &blen);
+        if (packet == NULL) {
+            /* Without a packet the responder took the empty-reply path,
+             * which __wrap_sss_cmd_send_empty mocks without building one.
+             * Report the answer that path carries. */
+            sss_nss_test_ctx->tctx->error = check_cb(ENOENT, NULL, 0);
+        } else {
+            __real_sss_packet_get_body(packet, &body, &blen);
 
-        sss_nss_test_ctx->tctx->error = check_cb(sss_packet_get_status(packet),
-                                             body, blen);
+            sss_nss_test_ctx->tctx->error =
+                check_cb(sss_packet_get_status(packet), body, blen);
+        }
     }
 
     sss_nss_test_ctx->tctx->done = true;
@@ -5410,6 +5418,363 @@ void test_sss_nss_initgroups_ex(void **state)
     assert_int_equal(ret, EOK);
 }
 
+/* SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE asks the NSS responder to answer
+ * EAGAIN instead of ENOENT for an entry that is not cached when the backend
+ * request for it failed. Each test below covers four cases: the flag with an
+ * empty cache and a failed backend, the same case without the flag, the flag
+ * with an expired cache entry and a failed backend, and the flag with a
+ * successful backend that finds nothing. One test covers each of the lookup
+ * shapes the sidecar uses: by name, by ID and initgroups. */
+
+/* Fixtures for the backend-failure tests. The sysdb survives from one test
+ * to the next inside this binary, so these names must be unique. */
+struct passwd be_pwnam_cached_usr = {
+    .pw_name = discard_const("testbe_pwnam_cached"),
+    .pw_uid = 901,
+    .pw_gid = 902,
+    .pw_dir = discard_const("/home/testbe_pwnam_cached"),
+    .pw_gecos = discard_const("backend failure cached user"),
+    .pw_shell = discard_const("/bin/sh"),
+    .pw_passwd = discard_const("*"),
+};
+
+static int test_sss_nss_be_pwnam_check(uint32_t status, uint8_t *body,
+                                       size_t blen)
+{
+    struct passwd pwd;
+    errno_t ret;
+
+    assert_int_equal(status, EOK);
+
+    ret = parse_user_packet(body, blen, &pwd);
+    assert_int_equal(ret, EOK);
+
+    assert_users_equal(&pwd, &be_pwnam_cached_usr);
+    return EOK;
+}
+
+struct passwd be_pwuid_cached_usr = {
+    .pw_name = discard_const("testbe_pwuid_cached"),
+    .pw_uid = 911,
+    .pw_gid = 912,
+    .pw_dir = discard_const("/home/testbe_pwuid_cached"),
+    .pw_gecos = discard_const("backend failure cached user by id"),
+    .pw_shell = discard_const("/bin/sh"),
+    .pw_passwd = discard_const("*"),
+};
+
+static int test_sss_nss_be_pwuid_check(uint32_t status, uint8_t *body,
+                                       size_t blen)
+{
+    struct passwd pwd;
+    errno_t ret;
+
+    assert_int_equal(status, EOK);
+
+    ret = parse_user_packet(body, blen, &pwd);
+    assert_int_equal(ret, EOK);
+
+    assert_users_equal(&pwd, &be_pwuid_cached_usr);
+    return EOK;
+}
+
+struct passwd be_initgr_cached_usr = {
+    .pw_name = discard_const("testbe_initgr_cached"),
+    .pw_uid = 931,
+    .pw_gid = 932,
+    .pw_dir = discard_const("/home/testbe_initgr_cached"),
+    .pw_gecos = discard_const("backend failure cached initgroups user"),
+    .pw_shell = discard_const("/bin/sh"),
+    .pw_passwd = discard_const("*"),
+};
+
+struct group be_initgr_cached_gr1 = {
+    .gr_gid = 9311,
+    .gr_name = discard_const("testbe_initgr_cached_gr1"),
+    .gr_passwd = discard_const("*"),
+    .gr_mem = NULL,
+};
+
+struct group be_initgr_cached_gr2 = {
+    .gr_gid = 9312,
+    .gr_name = discard_const("testbe_initgr_cached_gr2"),
+    .gr_passwd = discard_const("*"),
+    .gr_mem = NULL,
+};
+
+static int test_sss_nss_be_initgr_check(uint32_t status, uint8_t *body,
+                                        size_t blen)
+{
+    gid_t expected_gids[] = { 9311, 9312 };
+
+    assert_int_equal(status, EOK);
+    check_initgr_packet(body, blen, expected_gids, N_ELEMENTS(expected_gids));
+    return EOK;
+}
+
+static int test_sss_nss_EAGAIN_check(uint32_t status, uint8_t *body,
+                                     size_t blen)
+{
+    assert_int_equal(status, EAGAIN);
+    assert_int_equal(blen, 0);
+
+    return EOK;
+}
+
+void test_sss_nss_getpwnam_ex_report_backend_failure(void **state)
+{
+    errno_t ret;
+
+    /* Flag, failed backend, empty cache: try again. */
+    mock_input_user_or_group_ex(true, "testbe_byname_miss",
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    will_return(__wrap_sss_packet_get_cmd, SSS_NSS_GETPWNAM_EX);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+
+    set_cmd_cb(test_sss_nss_EAGAIN_check);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWNAM_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, EOK);
+    RESET_TCTX;
+
+    /* No flag, same case: not found. This is the answer every glibc caller
+     * keeps receiving. */
+    mock_input_user_or_group_ex(true, "testbe_byname_flagless", 0);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWNAM_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+    RESET_TCTX;
+
+    /* Flag, failed backend, expired cache entry: the cached entry. */
+    ret = store_user(sss_nss_test_ctx, sss_nss_test_ctx->tctx->dom,
+                     &be_pwnam_cached_usr, NULL, 1);
+    assert_int_equal(ret, EOK);
+
+    mock_input_user_or_group_ex(true, be_pwnam_cached_usr.pw_name,
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    will_return(__wrap_sss_packet_get_cmd, SSS_NSS_GETPWNAM_EX);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+    mock_fill_user();
+
+    set_cmd_cb(test_sss_nss_be_pwnam_check);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWNAM_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, EOK);
+    RESET_TCTX;
+
+    /* Flag, successful backend that finds nothing: not found. */
+    mock_input_user_or_group_ex(true, "testbe_byname_absent",
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    mock_account_recv_simple();
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWNAM_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+    RESET_TCTX;
+
+    /* Flag, the same name again inside the negative-cache window: still not
+     * found. The entry is known absent, so no backend failure is reported
+     * and no data provider request is made. */
+    mock_input_user_or_group_ex(true, "testbe_byname_absent",
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWNAM_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+}
+
+void test_sss_nss_getpwuid_ex_report_backend_failure(void **state)
+{
+    errno_t ret;
+
+    /* Flag, failed backend, empty cache: try again. */
+    mock_input_id_ex(sss_nss_test_ctx, 7001,
+                     SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    will_return(__wrap_sss_packet_get_cmd, SSS_NSS_GETPWUID_EX);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+
+    set_cmd_cb(test_sss_nss_EAGAIN_check);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWUID_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, EOK);
+    RESET_TCTX;
+
+    /* No flag, same case: not found. */
+    mock_input_id_ex(sss_nss_test_ctx, 7002, 0);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWUID_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+    RESET_TCTX;
+
+    /* Flag, failed backend, expired cache entry: the cached entry. */
+    ret = store_user(sss_nss_test_ctx, sss_nss_test_ctx->tctx->dom,
+                     &be_pwuid_cached_usr, NULL, 1);
+    assert_int_equal(ret, EOK);
+
+    mock_input_id_ex(sss_nss_test_ctx, be_pwuid_cached_usr.pw_uid,
+                     SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    will_return(__wrap_sss_packet_get_cmd, SSS_NSS_GETPWUID_EX);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+    mock_fill_user();
+
+    set_cmd_cb(test_sss_nss_be_pwuid_check);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWUID_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, EOK);
+    RESET_TCTX;
+
+    /* Flag, successful backend that finds nothing: not found. */
+    mock_input_id_ex(sss_nss_test_ctx, 7003,
+                     SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    mock_account_recv_simple();
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_GETPWUID_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+}
+
+void test_sss_nss_initgroups_ex_report_backend_failure(void **state)
+{
+    errno_t ret;
+    struct sysdb_attrs *attrs;
+
+    /* Flag, failed backend, empty cache: try again. */
+    mock_input_user_or_group_ex(true, "testbe_initgr_miss",
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    will_return(__wrap_sss_packet_get_cmd, SSS_NSS_INITGR_EX);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+
+    set_cmd_cb(test_sss_nss_EAGAIN_check);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_INITGR_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, EOK);
+    RESET_TCTX;
+
+    /* No flag, same case: not found. */
+    mock_input_user_or_group_ex(true, "testbe_initgr_flagless", 0);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_INITGR_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+    RESET_TCTX;
+
+    /* Flag, failed backend, expired cache entry: the cached entry. */
+    attrs = sysdb_new_attrs(sss_nss_test_ctx);
+    assert_non_null(attrs);
+
+    ret = sysdb_attrs_add_time_t(attrs, SYSDB_INITGR_EXPIRE, 1);
+    assert_int_equal(ret, EOK);
+
+    ret = store_user(sss_nss_test_ctx, sss_nss_test_ctx->tctx->dom,
+                     &be_initgr_cached_usr, attrs, 0);
+    assert_int_equal(ret, EOK);
+
+    ret = store_group(sss_nss_test_ctx, sss_nss_test_ctx->tctx->dom,
+                      &be_initgr_cached_gr1, NULL, 0);
+    assert_int_equal(ret, EOK);
+
+    ret = store_group(sss_nss_test_ctx, sss_nss_test_ctx->tctx->dom,
+                      &be_initgr_cached_gr2, NULL, 0);
+    assert_int_equal(ret, EOK);
+
+    ret = store_group_member(sss_nss_test_ctx,
+                             be_initgr_cached_gr1.gr_name,
+                             sss_nss_test_ctx->tctx->dom,
+                             be_initgr_cached_usr.pw_name,
+                             sss_nss_test_ctx->tctx->dom,
+                             SYSDB_MEMBER_USER);
+    assert_int_equal(ret, EOK);
+
+    ret = store_group_member(sss_nss_test_ctx,
+                             be_initgr_cached_gr2.gr_name,
+                             sss_nss_test_ctx->tctx->dom,
+                             be_initgr_cached_usr.pw_name,
+                             sss_nss_test_ctx->tctx->dom,
+                             SYSDB_MEMBER_USER);
+    assert_int_equal(ret, EOK);
+
+    mock_input_user_or_group_ex(true, be_initgr_cached_usr.pw_name,
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    will_return(__wrap_sss_packet_get_cmd, SSS_NSS_INITGR_EX);
+    mock_account_recv(DP_ERR_FATAL, 0, discard_const("backend failed"),
+                      NULL, NULL);
+    mock_fill_user();
+
+    set_cmd_cb(test_sss_nss_be_initgr_check);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_INITGR_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, EOK);
+    RESET_TCTX;
+
+    /* Flag, successful backend that finds nothing: not found. */
+    mock_input_user_or_group_ex(true, "testbe_initgr_absent",
+                                SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE);
+    mock_account_recv_simple();
+
+    set_cmd_cb(NULL);
+    ret = sss_cmd_execute(sss_nss_test_ctx->cctx, SSS_NSS_INITGR_EX,
+                          sss_nss_test_ctx->sss_nss_cmds);
+    assert_int_equal(ret, EOK);
+
+    ret = test_ev_loop(sss_nss_test_ctx->tctx);
+    assert_int_equal(ret, ENOENT);
+}
+
 const char *test_hostent_aliases[] = {
     "testhost_alias1",
     "testhost_alias2",
@@ -6175,6 +6540,15 @@ int main(int argc, const char *argv[])
                                         sss_nss_test_setup, sss_nss_test_teardown),
         cmocka_unit_test_setup_teardown(test_sss_nss_initgroups_ex,
                                         sss_nss_test_setup, sss_nss_test_teardown),
+        cmocka_unit_test_setup_teardown(
+                            test_sss_nss_getpwnam_ex_report_backend_failure,
+                            sss_nss_test_setup, sss_nss_test_teardown),
+        cmocka_unit_test_setup_teardown(
+                            test_sss_nss_getpwuid_ex_report_backend_failure,
+                            sss_nss_test_setup, sss_nss_test_teardown),
+        cmocka_unit_test_setup_teardown(
+                            test_sss_nss_initgroups_ex_report_backend_failure,
+                            sss_nss_test_setup, sss_nss_test_teardown),
         cmocka_unit_test_setup_teardown(test_sss_nss_gethostbyname,
                                         sss_nss_host_test_setup,
                                         sss_nss_host_test_teardown),

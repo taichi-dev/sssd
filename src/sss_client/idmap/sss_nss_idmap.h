@@ -278,6 +278,10 @@ void sss_nss_free_kv(struct sss_nss_kv *kv_list);
  *  This flag cannot be used together with SSS_NSS_EX_FLAG_NO_CACHE */
 #define SSS_NSS_EX_FLAG_INVALIDATE_CACHE (1 << 1)
 
+/** Answer EAGAIN, not ENOENT, for an entry that is absent from the cache
+ *  when the backend request for it failed. */
+#define SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE (1 << 2)
+
 #ifdef IPA_389DS_PLUGIN_HELPER_CALLS
 
 /**
@@ -296,6 +300,8 @@ void sss_nss_free_kv(struct sss_nss_kv *kv_list);
  *  - 0:
  *  - ENOENT:    no user with the given name found
  *  - ERANGE:    Insufficient buffer space supplied
+ *  - EAGAIN:    backend request failed and the entry is not cached,
+ *               see SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE
  *  - ETIMEDOUT: request timed out
  */
 int sss_nss_getpwnam_timeout(const char *name, struct passwd *pwd,
@@ -319,6 +325,8 @@ int sss_nss_getpwnam_timeout(const char *name, struct passwd *pwd,
  *  - 0:
  *  - ENOENT:    no user with the given uid found
  *  - ERANGE:    Insufficient buffer space supplied
+ *  - EAGAIN:    backend request failed and the entry is not cached,
+ *               see SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE
  *  - ETIMEDOUT: request timed out
  */
 int sss_nss_getpwuid_timeout(uid_t uid, struct passwd *pwd,
@@ -342,6 +350,8 @@ int sss_nss_getpwuid_timeout(uid_t uid, struct passwd *pwd,
  *  - 0:
  *  - ENOENT:    no group with the given name found
  *  - ERANGE:    Insufficient buffer space supplied
+ *  - EAGAIN:    backend request failed and the entry is not cached,
+ *               see SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE
  *  - ETIMEDOUT: request timed out
  */
 int sss_nss_getgrnam_timeout(const char *name, struct group *grp,
@@ -364,6 +374,8 @@ int sss_nss_getgrnam_timeout(const char *name, struct group *grp,
  *  - 0:
  *  - ENOENT:    no group with the given gid found
  *  - ERANGE:    Insufficient buffer space supplied
+ *  - EAGAIN:    backend request failed and the entry is not cached,
+ *               see SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE
  *  - ETIMEDOUT: request timed out
  */
 int sss_nss_getgrgid_timeout(gid_t gid, struct group *grp,
@@ -392,6 +404,8 @@ int sss_nss_getgrgid_timeout(gid_t gid, struct group *grp,
  *  - 0:         success
  *  - ENOENT:    no user with the given name found
  *  - ERANGE:    Insufficient buffer space supplied
+ *  - EAGAIN:    backend request failed and the entry is not cached,
+ *               see SSS_NSS_EX_FLAG_REPORT_BACKEND_FAILURE
  *  - ETIMEDOUT: request timed out
  */
 int sss_nss_getgrouplist_timeout(const char *name, gid_t group,

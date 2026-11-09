@@ -324,6 +324,11 @@ cache_req_search_send(TALLOC_CTX *mem_ctx,
     state->ev = ev;
     state->cr = cr;
 
+    /* No backend request has failed yet. Only a data provider reply turns
+     * this false, so a search that answers from the negative cache or stops
+     * before contacting the provider is not reported as a backend failure. */
+    state->dp_success = true;
+
     ret = cache_req_search_ncache(cr);
     if (ret != EOK) {
         goto done;
