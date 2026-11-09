@@ -324,10 +324,12 @@ cache_req_search_send(TALLOC_CTX *mem_ctx,
     state->ev = ev;
     state->cr = cr;
 
-    /* No backend request has failed yet. Only a data provider reply turns
-     * this false, so a search that answers from the negative cache or stops
-     * before contacting the provider is not reported as a backend failure. */
-    state->dp_success = true;
+    /* Only a data provider reply sets dp_success to its outcome. A request
+     * that propagates the offline status starts from success, so a search
+     * that never reaches the provider, such as a negative-cache hit, is not
+     * taken for a backend failure. Other requests start from false, so such
+     * a search keeps the caller from writing the global negative entry. */
+    state->dp_success = cr->data->propogate_offline_status;
 
     ret = cache_req_search_ncache(cr);
     if (ret != EOK) {

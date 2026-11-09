@@ -1299,6 +1299,49 @@ void test_user_by_id_multiple_domains_notfound(void **state)
     assert_true(test_ctx->dp_called);
 }
 
+void test_user_by_id_multiple_domains_ncache_hit_no_global(void **state)
+{
+    struct cache_req_test_ctx *test_ctx = NULL;
+    struct sss_domain_info *locate_dom = NULL;
+    struct sss_domain_info *domain = NULL;
+    errno_t ret;
+
+    test_ctx = talloc_get_type_abort(*state, struct cache_req_test_ctx);
+
+    domain = find_domain_by_name(test_ctx->tctx->dom,
+                                 "responder_cache_req_test_a", true);
+    assert_non_null(domain);
+
+    /* The uid is known absent in the first domain only. */
+    ret = sss_ncache_set_uid(test_ctx->ncache, false, domain, users[0].uid);
+    assert_int_equal(ret, EOK);
+
+    /* Mark the domain locator as unsupported in every domain, so the domain
+     * searches are the only searches that run. */
+    for (size_t i = 0; domains[i] != NULL; i++) {
+        locate_dom = find_domain_by_name(test_ctx->tctx->dom, domains[i], true);
+        assert_non_null(locate_dom);
+
+        ret = sss_ncache_set_domain_locate_type(test_ctx->rctx->ncache,
+                                                get_domains_head(locate_dom),
+                                                "User by ID");
+        assert_int_equal(ret, EOK);
+    }
+
+    /* Mock values. The other domains answer not found. */
+    will_return_always(__wrap_sss_dp_get_account_send, test_ctx);
+    will_return_always(sss_dp_get_account_recv, 0);
+
+    /* Test. A flagless search that answers from a domain's negative cache
+     * does not set dp_success, so cache_req does not add the global negative
+     * entry, even though every other domain answered not found. */
+    run_user_by_id(test_ctx, NULL, 0, ENOENT);
+    assert_true(test_ctx->dp_called);
+
+    ret = sss_ncache_check_uid(test_ctx->ncache, NULL, users[0].uid);
+    assert_int_equal(ret, ENOENT);
+}
+
 void test_user_by_id_multiple_domains_locator_cache_valid(void **state)
 {
     struct cache_req_test_ctx *test_ctx = NULL;
@@ -4390,6 +4433,7 @@ int main(int argc, const char *argv[])
         new_single_domain_test(user_by_id_missing_notfound),
         new_multi_domain_test(user_by_id_multiple_domains_found),
         new_multi_domain_test(user_by_id_multiple_domains_notfound),
+        new_multi_domain_test(user_by_id_multiple_domains_ncache_hit_no_global),
         new_single_domain_id_limit_test(user_by_id_below_id_range),
         new_single_domain_id_limit_test(user_by_id_above_id_range),
 
